@@ -1,0 +1,172 @@
+trigger:
+  branches:
+    include:
+      - main
+
+parameters:
+  - name: stage
+    displayName: Environment
+    type: string
+    default: dev
+    values:
+      - dev
+      - qa
+      - prod
+
+variables:
+  - group: tf-creds-group            # Variable group with service principal, subscriptions, secrets (link to KeyVault)
+  backendRg: '$(backendResourceGroup)'   # define in var group or override per env
+  backendStorage: '$(backendStorageAccount)'
+  backendContainer: 'tfstate'
+  terraformVersion: '1.5.9'         # pin to a tested version
+
+stages:
+
+# 1. Lint / fmt / validate + terraform init & plan
+- stage: Plan
+  displayName: 'Terraform: Format, Validate, Init & Plan'
+  jobs:
+  - job: plan
+    displayName: 'Format/Validate/Init/Plan'
+    pool:
+      name: 'CSX-Self hosted'
+    steps:
+
+    - checkout: self
+      persistCredentials: true
+
+    - task: UseTerraform@0   # or TerraformInstaller pinned; example using installer task
+      displayName: 'Install Terraform'
+      inputs:
+        terraformVersion: '$(terraformVersion)'
+
+    - script: |
+        cd ${{ parameters.stage }}
+        terraform fmt -check -recursive
+      displayName: 'terraform fmt (check)'
+      continueOnError: false
+
+    - script: |
+        cd ${{ parameters.stage }}
+        terraform validate -no-color
+      displayName: 'terraform validate'
+      continueOnError: false
+
+    - task: AzureCLI@2
+      name: azLogin
+      inputs:
+        azureSubscription: 'csx'            # service connection name (least privilege)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          echo "Configure backend variables"
+          # backend config can be set by env vars or -backend-config args
+      displayName: 'Prepare backend (Azure login)'
+
+    - task: TerraformTask@5
+      displayName: 'terraform init'
+      inputs:
+        provider: 'azurerm'
+        command: 'init'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/${{ parameters.stage }}'
+        backendServiceArm: 'csx'   # service connection
+        backendAzureRmResourceGroupName: '$(backendRg)'
+        backendAzureRmStorageAccountName: '$(backendStorage)'
+        backendAzureRmContainerName: '$(backendContainer)'
+        backendAzureRmKey: '${{ parameters.stage }}.tfstate'
+      continueOnError: false
+
+    - task: TerraformTask@5
+      displayName: 'terraform plan (save plan)'
+      inputs:
+        provider: 'azurerm'
+        command: 'plan'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/${{ parameters.stage }}'
+        environmentServiceNameAzureRM: 'csx'
+        secureVarsFile: ''                   # if using tfvars secret
+        args: '-out=tfplan.binary -input=false'
+      continueOnError: false
+
+    - publish: ${{ parameters.stage }}/tfplan.binary
+      artifact: terraform-plan-${{ parameters.stage }}
+      displayName: 'Publish terraform plan artifact'
+
+# 2. Security scans
+- stage: SecurityScan
+  displayName: 'Security Scans (tflint/tfsec/checkov)'
+  dependsOn: Plan
+  jobs:
+  - job: scans
+    pool:
+      name: 'CSX-Self hosted'
+    steps:
+    - checkout: self
+
+    - task: UseTerraform@0
+      inputs:
+        terraformVersion: '$(terraformVersion)'
+
+    - task: tflint@0
+      displayName: 'tflint'
+      inputs:
+        version: 'v0.43.2'
+        directory: '$(System.DefaultWorkingDirectory)/${{ parameters.stage }}'
+
+    - task: tfsec@1
+      displayName: 'tfsec'
+      inputs:
+        version: 'v1.26.0'
+        dir: '$(System.DefaultWorkingDirectory)/${{ parameters.stage }}'
+
+    - task: ShellScript@2
+      displayName: 'checkov'
+      inputs:
+        scriptPath: 'scripts/run_checkov.sh'   # example wrapper
+    - publish: reports
+      artifact: security-reports-${{ parameters.stage }}
+
+# 3. Manual / Environment approvals (use DevOps Environments recommended)
+- stage: Approve
+  displayName: 'Manual Approval'
+  dependsOn: SecurityScan
+  condition: and(succeeded(), eq('${{ parameters.stage }}','prod')) # require only for prod; remove condition to require for all
+  jobs:
+  - deployment: ManualGate
+    displayName: 'Manual approval for prod'
+    environment: 'prod'      # use Azure DevOps Environment to attach checks
+    pool:
+      name: server
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: ManualValidation@1
+            inputs:
+              notifyUsers: 'pawangiri3@gmail.com'
+              approvers: 'pawangiri3@gmail.com'
+
+# 4. Apply stage (consumes plan artifact; only runs when approved)
+- stage: Apply
+  displayName: 'Terraform: Apply'
+  dependsOn: 
+    - SecurityScan
+    - Approve
+  condition: succeeded()
+  jobs:
+  - job: apply
+    displayName: 'terraform apply'
+    pool:
+      name: 'CSX-Self hosted'
+    steps:
+    - download: current
+      artifact: terraform-plan-${{ parameters.stage }}
+      displayName: 'Download plan artifact'
+
+    - task: TerraformTask@5
+      displayName: 'terraform apply (using plan)'
+      inputs:
+        provider: 'azurerm'
+        command: 'apply'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/${{ parameters.stage }}'
+        environmentServiceNameAzureRM: 'csx'
+        args: '-input=false tfplan.binary'

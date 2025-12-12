@@ -1,0 +1,219 @@
+# Enterprise-ready Azure DevOps pipeline for Terraform
+# Converted from your original pipeline and enhanced with:
+# - pinned tool versions
+# - fmt/validate
+# - artifactized terraform plan (for auditable apply)
+# - separate Plan / Security / Approval / Apply stages
+# - environment-based prod approval
+# - comments explain why each block exists (see inline comments)
+
+trigger:
+  branches:
+    include:
+      - main
+
+parameters:
+  - name: stage
+    displayName: Environment
+    type: string
+    default: dev
+    values:
+      - dev
+      - qa
+      - prod
+
+# Variables: prefer storing secrets and credentials in Variable Groups or Key Vault
+variables:
+  - group: csx-tf-vars           # <-- change to your variable group that contains backend and service connection details
+  backendRg: 'riya-rg'           # backend resource group (from your original YAML)
+  backendStorage: 'csxstorageinfra' # backend storage account (from original)
+  backendContainer: 'tfstate'
+  terraformVersion: '1.5.9'      # pin a tested Terraform version (avoid 'latest')
+  tfsecVersion: 'v1.26.0'        # pin scanner versions
+  tflintVersion: 'v0.43.2'
+  checkovVersion: '2.1.0'
+
+stages:
+
+# ---------- Stage: Plan ----------
+- stage: Plan
+  displayName: 'Terraform: Format, Validate, Init & Plan'
+  jobs:
+  - job: terraformINITPLAN
+    displayName: 'Format / Validate / Init / Plan'
+    pool:
+      name: 'CSX-Self hosted'   # <-- use a secured agent pool (self-hosted or Microsoft-hosted depending on policy)
+    steps:
+
+    - checkout: self
+      persistCredentials: true
+      # persistCredentials allows the pipeline to use repo credentials if needed (e.g., for modules in the same repo)
+
+    - task: TerraformInstaller@1
+      displayName: 'Install Terraform (pinned)'
+      inputs:
+        terraformVersion: '$(terraformVersion)'
+      # Why: pinning ensures builds are reproducible and not affected by upstream 'latest' changes
+
+    - script: |
+        cd ${{ parameters.stage }}
+        terraform fmt -check -recursive
+      displayName: 'terraform fmt (check)'
+      # Why: ensures code is formatted; fails early if formatting is off so PRs/pipelines are consistent
+
+    - script: |
+        cd ${{ parameters.stage }}
+        terraform validate -no-color
+      displayName: 'terraform validate'
+      # Why: basic static validation of Terraform configuration before init/plan
+
+    - task: AzureCLI@2
+      displayName: 'Azure login (service connection)'
+      inputs:
+        azureSubscription: 'csx'   # <-- service connection name; use least-privilege SPN
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          echo "Logged in via service connection"
+      # Why: ensures subsequent tasks that rely on Azure auth have an active login context
+
+    - task: TerraformTask@5
+      displayName: 'terraform init (with backend)'
+      inputs:
+        provider: 'azurerm'
+        command: 'init'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/${{ parameters.stage }}'
+        backendServiceArm: 'csx'
+        backendAzureRmResourceGroupName: '$(backendRg)'
+        backendAzureRmStorageAccountName: '$(backendStorage)'
+        backendAzureRmContainerName: '$(backendContainer)'
+        backendAzureRmKey: '${{ parameters.stage }}.tfstate'
+      # Why: ensure state is initialized against the shared backend. Use consistent key per env to avoid collisions.
+
+    - task: TerraformTask@5
+      displayName: 'terraform plan (save plan to file)'
+      inputs:
+        provider: 'azurerm'
+        command: 'plan'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/${{ parameters.stage }}'
+        environmentServiceNameAzureRM: 'csx'
+        args: '-out=tfplan.binary -input=false'
+      # Why: -out creates a binary plan artifact that can be reviewed/applied later (prevents drift between plan & apply)
+
+    - publish: '$(System.DefaultWorkingDirectory)/${{ parameters.stage }}/tfplan.binary'
+      artifact: 'terraform-plan-${{ parameters.stage }}'
+      displayName: 'Publish terraform plan artifact'
+      # Why: publishing the plan makes it available to downstream stages (security scans, apply). Provides auditable artifact.
+
+
+# ---------- Stage: SecurityScan ----------
+- stage: SecurityScan
+  displayName: 'Security Scans (tflint / tfsec / checkov)'
+  dependsOn: Plan
+  jobs:
+  - job: tfsec
+    displayName: 'Run security and lint scans'
+    pool:
+      name: 'CSX-Self hosted'
+    steps:
+    - checkout: self
+
+    - task: TerraformInstaller@1
+      displayName: 'Install Terraform for scanners (pinned)'
+      inputs:
+        terraformVersion: '$(terraformVersion)'
+
+    - script: |
+        # tflint checks for provider-specific best practices and linter issues
+        curl -sSL https://raw.githubusercontent.com/terraform-linters/tflint/master/install_linux.sh | bash -s -- -b /usr/local/bin $(tflint --version || true)
+        tflint --version || true
+      displayName: 'tflint (example install)'
+      # Note: replace with a proper task or container in your agents. Pinned versions preferred.
+
+    - task: tfsec@1
+      displayName: 'tfsec scan (pinned)'
+      inputs:
+        version: '$(tfsecVersion)'
+        dir: '$(System.DefaultWorkingDirectory)/${{ parameters.stage }}'
+      # Why: tfsec finds security issues in IaC
+
+    - script: |
+        # Example checkov run; if you have a Checkov task/plugin, use that instead.
+        checkov -d $(System.DefaultWorkingDirectory)/${{ parameters.stage }} --quiet || true
+      displayName: 'checkov'
+      # Why: multiple scanners catch different classes of issues. Configure exit codes/policies as per org risk appetite.
+
+    - publish: 'reports'
+      artifact: 'security-reports-${{ parameters.stage }}'
+      displayName: 'Publish security reports (if any)'
+
+
+# ---------- Stage: Approve (Prod Only) ----------
+- stage: Approve
+  displayName: 'Manual Approval (Prod Gate)'
+  dependsOn: SecurityScan
+  condition: and(succeeded(), eq('${{ parameters.stage }}','prod'))
+  jobs:
+  - deployment: ManualValidationJob
+    displayName: 'Manual approval for prod (using Environment)'
+    environment: 'prod'   # link to an Azure DevOps Environment to leverage environment checks
+    pool:
+      name: server
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: ManualValidation@1
+            displayName: 'Manual Validation (Notify approvers)'
+            inputs:
+              notifyUsers: 'pawangiri3@gmail.com'
+              approvers: 'pawangiri3@gmail.com'
+      # Why: require human approval before making prod changes. Use environment-level checks for better governance.
+
+
+# ---------- Stage: Apply ----------
+- stage: Apply
+  displayName: 'Terraform: Apply'
+  dependsOn:
+    - SecurityScan
+    - Approve
+  condition: succeeded()
+  jobs:
+  - job: terraformApply
+    displayName: 'Apply the published plan'
+    pool:
+      name: 'CSX-Self hosted'
+    steps:
+
+    - download: current
+      artifact: 'terraform-plan-${{ parameters.stage }}'
+      displayName: 'Download plan artifact'
+
+    - task: TerraformInstaller@1
+      displayName: 'Install Terraform (apply)'
+      inputs:
+        terraformVersion: '$(terraformVersion)'
+
+    - task: TerraformTask@5
+      displayName: 'terraform apply (using plan)'
+      inputs:
+        provider: 'azurerm'
+        command: 'apply'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/${{ parameters.stage }}'
+        environmentServiceNameAzureRM: 'csx'
+        args: '-input=false tfplan.binary'
+      # Why: apply consumes the exact plan produced earlier, ensuring what was reviewed is what's applied (auditable)
+
+    - script: |
+        echo "Post-apply: consider running smoke tests / health checks here"
+      displayName: 'Post-apply validation (optional)'
+
+# --------- End of pipeline ---------
+
+# IMPORTANT NOTES / TODOs for your environment:
+# - Replace variable group name 'csx-tf-vars' with your real variable group which stores secrets and backend names.
+# - Ensure the service connection 'csx' has least-privilege rights required (reader/storage blob contributor for state + relevant infra RBAC).
+# - Consider using Azure Key Vault-backed variable groups for secrets. In pipeline, reference secrets using $(secretName).
+# - Consider adding automatic retries or a wrapper to handle transient Azure storage failures when initializing backend.
+# - You can adjust which stages require approval by changing the condition on the Approve stage.
+# - If you use Terraform Cloud/Enterprise, adapt the backend and plan/apply flow accordingly.

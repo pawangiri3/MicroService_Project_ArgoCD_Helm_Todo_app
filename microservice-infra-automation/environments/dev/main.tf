@@ -2,63 +2,64 @@ locals {
   common_tags = {
     "ManagedBy"   = "Terraform"
     "Owner"       = "TodoAppTeam"
-    "Environment" = "dev"
+    "Environment" = var.environment
   }
 }
 
 
 module "rg" {
   source      = "../../modules/azurerm_resource_group"
-  rg_name     = "dev-todoapp-01"
-  rg_location = "centralindia"
+  rg_name     = var.rg_name
+  rg_location = var.location
   rg_tags     = local.common_tags
 }
 
 module "acr" {
   depends_on = [module.rg]
   source     = "../../modules/azurerm_container_registry"
-  acr_name   = "acrdevtodoapp01"
-  rg_name    = "dev-todoapp-01"
-  location   = "centralindia"
+  acr_name   = var.acr_name
+  rg_name    = var.rg_name
+  location   = var.location
   tags       = local.common_tags
 }
 
 module "sql_server" {
   depends_on      = [module.rg]
   source          = "../../modules/azurerm_sql_server"
-  sql_server_name = "sql-dev-todoapp-01"
-  rg_name         = "dev-todoapp-01"
-  location        = "centralindia"
-  admin_username  = "azureuser"
-  admin_password  = "P@ssw01rd@123"
+  sql_server_name = var.sql_server_name
+  rg_name         = var.rg_name
+  location        = var.location
+  admin_username  = var.admin_username
+  admin_password  = var.admin_password
   tags            = local.common_tags
 }
 
 module "sql_db" {
   depends_on  = [module.sql_server]
   source      = "../../modules/azurerm_sql_database"
-  sql_db_name = "sqldb-dev-todoapp"
+  sql_db_name = var.sql_db_name
   server_id   = module.sql_server.server_id
-  max_size_gb = "2"
+  max_size_gb = var.max_size_gb
   tags        = local.common_tags
 }
 
 module "aks" {
   depends_on = [module.rg]
   source     = "../../modules/azurerm_kubernetes_cluster"
-  aks_name   = "aks-dev-todoapp"
-  location   = "centralindia"
-  rg_name    = "dev-todoapp-01"
-  dns_prefix = "aks-dev-todoapp"
+  aks_name   = var.aks_name
+  location   = var.location
+  rg_name    = var.rg_name
+  dns_prefix = var.dns_prefix
   tags       = local.common_tags
 }
 
 
-module "pip" {
-  source   = "../../modules/azurerm_public_ip"
-  pip_name = "pip-dev-todoapp"
-  rg_name  = "dev-todoapp-01"
-  location = "centralindia"
-  sku      = "Basic"
-  tags     = local.common_tags
-}
+# module "pip" {
+#   depends_on = [module.rg]
+#   source   = "../../modules/azurerm_public_ip"
+#   pip_name = "pip-dev-todoapp"
+#   rg_name  = "dev-todoapp-01"
+#   location = "central india"
+#   sku      = "Basic"
+#   tags     = local.common_tags
+# }
